@@ -32,6 +32,10 @@ interface ExtensionState {
     registeredContextMenus: boolean;
 }
 
+interface SystemColorState {
+    isDark: boolean | null;
+}
+
 declare const __DEBUG__: boolean;
 
 export class Extension implements ExtensionState {
@@ -54,6 +58,12 @@ export class Extension implements ExtensionState {
 
     private static ALARM_NAME = 'auto-time-alarm';
     private static LOCAL_STORAGE_KEY = 'Extension-state';
+
+    // Store system color theme
+    private static SYSTEM_COLOR_LOCAL_STORAGE_KEY = 'system-color-state';
+    private systemColorStateManager: StateManager<SystemColorState>;
+    private isDark: boolean | null = null;
+
     constructor() {
         this.config = new ConfigManager();
         this.devtools = new DevTools(this.config, async () => this.onSettingsChanged());
@@ -86,6 +96,35 @@ export class Extension implements ExtensionState {
         }
     }
 
+    private async MV3initSystemColorStateManager(isDark: boolean | null): Promise<void> {
+        if (!isMV3) {
+            return;
+        }
+        if (!this.systemColorStateManager) {
+            this.systemColorStateManager = new StateManager<SystemColorState>(Extension.SYSTEM_COLOR_LOCAL_STORAGE_KEY, this, {
+                isDark,
+            });
+        }
+        if (isDark === null) {
+            // Attempt to restore data from storage
+            return this.systemColorStateManager.loadState();
+        } else if (this.isDark !== isDark) {
+            this.isDark = isDark;
+            return this.systemColorStateManager.saveState();
+        }
+    }
+
+    private async MV3saveSystemColorStateManager(): Promise<void> {
+        if (!isMV3) {
+            return;
+        }
+        if (!this.systemColorStateManager) {
+            logWarn('MV3saveSystemColorStateManager() called before MV3initSystemColorStateManager()');
+            return;
+        }
+        return this.systemColorStateManager.saveState();
+    }
+
     private alarmListener = (alarm: chrome.alarms.Alarm): void => {
         if (alarm.name === Extension.ALARM_NAME) {
             this.callWhenSettingsLoaded(() => {
@@ -109,15 +148,19 @@ export class Extension implements ExtensionState {
         let isAutoDark: boolean;
         let nextCheck: number;
         switch (automation) {
-            case 'time':
+            case 'time': {
                 const {time} = this.user.settings;
                 isAutoDark = isInTimeIntervalLocal(time.activation, time.deactivation);
                 nextCheck = nextTimeInterval(time.activation, time.deactivation);
                 break;
+            }
             case 'system':
                 if (isMV3) {
-                    logWarn('system automation is not yet supported. Defaulting to ON.');
-                    isAutoDark = true;
+                    isAutoDark = this.isDark;
+                    if (this.isDark === null) {
+                        logWarn('System color scheme is unknown. Defaulting to Dark.');
+                        isAutoDark = true;
+                    }
                     break;
                 }
                 if (isFirefox) {
@@ -137,9 +180,8 @@ export class Extension implements ExtensionState {
                 }
                 break;
             }
-            case '': {
+            case '':
                 break;
-            }
         }
 
         let state: AutomationState = '';
@@ -153,12 +195,17 @@ export class Extension implements ExtensionState {
         this.autoState = state;
 
         if (nextCheck) {
-            chrome.alarms.create(Extension.ALARM_NAME, {when: nextCheck});
+            if (nextCheck < Date.now()) {
+                logWarn(`Alarm is set in the past: ${nextCheck}. The time is: ${new Date()}. ISO: ${(new Date()).toISOString()}`);
+            } else {
+                chrome.alarms.create(Extension.ALARM_NAME, {when: nextCheck});
+            }
         }
     }
 
     async start() {
         await this.config.load({local: true});
+        await this.MV3initSystemColorStateManager(null);
 
         await this.user.loadSettings();
         if (this.user.settings.enableContextMenus && !this.registeredContextMenus) {
@@ -241,24 +288,12 @@ export class Extension implements ExtensionState {
             collect: async () => {
                 return await this.collectData();
             },
-            getActiveTabInfo: async () => {
-                if (!this.user.settings) {
-                    await this.user.loadSettings();
-                }
-                await this.stateManager.loadState();
-                const url = await this.tabs.getActiveTabURL();
-                const info = this.getURLInfo(url);
-                info.isInjected = await this.tabs.canAccessActiveTab();
-                if (this.user.settings.detectDarkTheme) {
-                    info.isDarkThemeDetected = await this.tabs.isActiveTabDarkThemeDetected();
-                }
-                return info;
-            },
             changeSettings: (settings) => this.changeSettings(settings),
             setTheme: (theme) => this.setTheme(theme),
             setShortcut: ({command, shortcut}) => this.setShortcut(command, shortcut),
-            toggleURL: (url) => this.toggleURL(url),
+            toggleActiveTab: async () => this.toggleActiveTab(),
             markNewsAsRead: async (ids) => await this.news.markAsRead(...ids),
+            markNewsAsDisplayed: async (ids) => await this.news.markAsDisplayed(...ids),
             onPopupOpen: () => this.popupOpeningListener && this.popupOpeningListener(),
             loadConfig: async (options) => await this.config.load(options),
             applyDevDynamicThemeFixes: (text) => this.devtools.applyDynamicThemeFixes(text),
@@ -283,15 +318,16 @@ export class Extension implements ExtensionState {
                     automation: '',
                 });
                 break;
-            case 'addSite':
+            case 'addSite': {
                 logInfo('Add Site command entered');
                 const url = frameURL || await this.tabs.getActiveTabURL();
                 if (isPDF(url)) {
                     this.changeSettings({enableForPDF: !this.user.settings.enableForPDF});
                 } else {
-                    this.toggleURL(url);
+                    this.toggleActiveTab();
                 }
                 break;
+            }
             case 'switchEngine': {
                 logInfo('Switch Engine command entered');
                 const engines = Object.values(ThemeEngines);
@@ -377,7 +413,22 @@ export class Extension implements ExtensionState {
                 hasCustomFilterFixes: await this.devtools.hasCustomFilterFixes(),
                 hasCustomStaticFixes: await this.devtools.hasCustomStaticFixes(),
             },
+            activeTab: await this.getActiveTabInfo(),
         };
+    }
+
+    private async getActiveTabInfo() {
+        if (!this.user.settings) {
+            await this.user.loadSettings();
+        }
+        await this.stateManager.loadState();
+        const url = await this.tabs.getActiveTabURL();
+        const info = this.getURLInfo(url);
+        info.isInjected = await this.tabs.canAccessActiveTab();
+        if (this.user.settings.detectDarkTheme) {
+            info.isDarkThemeDetected = await this.tabs.isActiveTabDarkThemeDetected();
+        }
+        return info;
     }
 
     private onNewsUpdate(news: News[]) {
@@ -386,8 +437,8 @@ export class Extension implements ExtensionState {
         }
 
         const latestNews = news.length > 0 && news[0];
-        if (latestNews && latestNews.important && !latestNews.read) {
-            this.icon.showImportantBadge();
+        if (latestNews && latestNews.badge && !latestNews.read && !latestNews.displayed) {
+            this.icon.showBadge(latestNews.badge);
             return;
         }
 
@@ -415,7 +466,8 @@ export class Extension implements ExtensionState {
             });
     }
 
-    private onColorSchemeChange = ({isDark}: {isDark: boolean}) => {
+    private onColorSchemeChange = (isDark: boolean) => {
+        this.MV3initSystemColorStateManager(isDark);
         if (isFirefox) {
             this.wasLastColorSchemeDark = isDark;
         }
@@ -501,32 +553,33 @@ export class Extension implements ExtensionState {
         this.messenger.reportChanges(info);
     }
 
-    toggleURL(url: string) {
+    async toggleActiveTab() {
+        const settings = this.user.settings;
+        const tab = await this.getActiveTabInfo();
+        const {url} = tab;
         const isInDarkList = isURLInList(url, this.config.DARK_SITES);
-        const siteList = isInDarkList ?
-            this.user.settings.siteListEnabled.slice() :
-            this.user.settings.siteList.slice();
-        const pattern = getURLHostOrProtocol(url);
-        const index = siteList.indexOf(pattern);
-        if (index < 0) {
-            siteList.push(pattern);
-        } else {
-            siteList.splice(index, 1);
-        }
-        if (isInDarkList) {
-            this.changeSettings({siteListEnabled: siteList});
-        } else {
-            this.changeSettings({siteList});
-        }
-    }
+        const host = getURLHostOrProtocol(url);
 
-    /**
-     * Adds host name of last focused tab
-     * into Sites List (or removes).
-     */
-    async toggleCurrentSite() {
-        const url = await this.tabs.getActiveTabURL();
-        this.toggleURL(url);
+        function getToggledList(sourceList: string[]) {
+            const list = sourceList.slice();
+            const index = list.indexOf(host);
+            if (index < 0) {
+                list.push(host);
+            } else {
+                list.splice(index, 1);
+            }
+            return list;
+        }
+
+        const darkThemeDetected = !settings.applyToListedOnly && settings.detectDarkTheme && tab.isDarkThemeDetected;
+        if (isInDarkList || darkThemeDetected || settings.siteListEnabled.includes(host)) {
+            const toggledList = getToggledList(settings.siteListEnabled);
+            this.changeSettings({siteListEnabled: toggledList});
+            return;
+        }
+
+        const toggledList = getToggledList(settings.siteList);
+        this.changeSettings({siteList: toggledList});
     }
 
     //------------------------------------
@@ -589,17 +642,18 @@ export class Extension implements ExtensionState {
     }
 
     private getTabMessage = (url: string, frameURL: string): TabData => {
+        const settings = this.user.settings;
         const urlInfo = this.getURLInfo(url);
-        if (this.isExtensionSwitchedOn() && isURLEnabled(url, this.user.settings, urlInfo)) {
-            const custom = this.user.settings.customThemes.find(({url: urlList}) => isURLInList(url, urlList));
-            const preset = custom ? null : this.user.settings.presets.find(({urls}) => isURLInList(url, urls));
-            let theme = custom ? custom.theme : preset ? preset.theme : this.user.settings.theme;
+        if (this.isExtensionSwitchedOn() && isURLEnabled(url, settings, urlInfo)) {
+            const custom = settings.customThemes.find(({url: urlList}) => isURLInList(url, urlList));
+            const preset = custom ? null : settings.presets.find(({urls}) => isURLInList(url, urls));
+            let theme = custom ? custom.theme : preset ? preset.theme : settings.theme;
             if (this.autoState === 'scheme-dark' || this.autoState === 'scheme-light') {
                 const mode = this.autoState === 'scheme-dark' ? 1 : 0;
                 theme = {...theme, mode};
             }
             const isIFrame = frameURL != null;
-            const detectDarkTheme = !isIFrame && this.user.settings.detectDarkTheme;
+            const detectDarkTheme = !isIFrame && settings.detectDarkTheme && !isURLInList(url, settings.siteListEnabled) && !isPDF(url);
 
             logInfo(`Creating CSS for url: ${url}`);
             logInfo(`Custom theme ${custom ? 'was found' : 'was not found'}, Preset theme ${preset ? 'was found' : 'was not found'}
@@ -641,7 +695,7 @@ export class Extension implements ExtensionState {
                             css: theme.stylesheet && theme.stylesheet.trim() ?
                                 theme.stylesheet :
                                 createStaticStylesheet(theme, url, frameURL, this.config.STATIC_THEMES_RAW, this.config.STATIC_THEMES_INDEX),
-                            detectDarkTheme: this.user.settings.detectDarkTheme,
+                            detectDarkTheme: settings.detectDarkTheme,
                         },
                     };
                 }
@@ -657,9 +711,8 @@ export class Extension implements ExtensionState {
                         },
                     };
                 }
-                default: {
+                default:
                     throw new Error(`Unknown engine ${theme.engine}`);
-                }
             }
         }
 

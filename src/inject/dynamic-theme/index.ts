@@ -16,12 +16,13 @@ import type {FilterConfig, DynamicThemeFix} from '../../definitions';
 import {generateUID} from '../../utils/uid';
 import type {AdoptedStyleSheetManager} from './adopted-style-manger';
 import {createAdoptedStyleSheetOverride} from './adopted-style-manger';
-import {isFirefox} from '../../utils/platform';
+import {isFirefox, isMV3} from '../../utils/platform';
 import {injectProxy} from './stylesheet-proxy';
 import {parse} from '../../utils/color';
 import {parsedURLCache} from '../../utils/url';
 import {variablesStore} from './variables';
 
+declare const __TEST__: boolean;
 const INSTANCE_ID = generateUID();
 const styleManagers = new Map<StyleElement, StyleManager>();
 const adoptedStyleManagers = [] as AdoptedStyleSheetManager[];
@@ -43,6 +44,9 @@ function createOrUpdateStyle(className: string, root: ParentNode = document.head
     return element;
 }
 
+/**
+ * Note: This function is used only with MV2.
+ */
 function createOrUpdateScript(className: string, root: ParentNode = document.head || document) {
     let element: HTMLScriptElement = root.querySelector(`.${className}`);
     if (!element) {
@@ -51,6 +55,18 @@ function createOrUpdateScript(className: string, root: ParentNode = document.hea
         element.classList.add(className);
     }
     return element;
+}
+
+/**
+ * Note: This function is used only with MV3.
+ * String passed as src parameter must be included in web_accessible_resources manifest key.
+ */
+function injectProxyScriptMV3(arg: boolean) {
+    logInfo('MV3 proxy injector: regular path attempts to inject...');
+    const element = document.createElement('script');
+    element.src = chrome.runtime.getURL('inject/proxy.js');
+    element.dataset.arg = JSON.stringify(arg);
+    document.head.prepend(element);
 }
 
 const nodePositionWatchers = new Map<string, ReturnType<typeof watchForNodePosition>>();
@@ -132,10 +148,17 @@ function createStaticStyleOverrides() {
     const rootVarsStyle = createOrUpdateStyle('darkreader--root-vars');
     document.head.insertBefore(rootVarsStyle, variableStyle.nextSibling);
 
-    const proxyScript = createOrUpdateScript('darkreader--proxy');
-    proxyScript.append(`(${injectProxy})(!${fixes && fixes.disableStyleSheetsProxy})`);
-    document.head.insertBefore(proxyScript, rootVarsStyle.nextSibling);
-    proxyScript.remove();
+    const injectProxyArg = !(fixes && fixes.disableStyleSheetsProxy);
+    if (isMV3) {
+        injectProxyScriptMV3(injectProxyArg);
+        // Notify dedicated injector of the data
+        document.dispatchEvent(new CustomEvent('__darkreader__stylesheetProxy__arg', {detail: injectProxyArg}));
+    } else {
+        const proxyScript = createOrUpdateScript('darkreader--proxy');
+        proxyScript.append(`(${injectProxy})(${injectProxyArg})`);
+        document.head.insertBefore(proxyScript, rootVarsStyle.nextSibling);
+        proxyScript.remove();
+    }
 }
 
 const shadowRootsWithOverrides = new Set<ShadowRoot>();
@@ -257,6 +280,9 @@ function createManager(element: StyleElement) {
         variablesStore.addRulesForMatching(details.rules);
         variablesStore.matchVariablesAndDependants();
         manager.render(filter, ignoredImageAnalysisSelectors);
+        if (__TEST__) {
+            document.dispatchEvent(new CustomEvent('__darkreader__test__dynamicUpdateComplete'));
+        }
     }
 
     const manager = manageStyle(element, {update, loadingStart, loadingEnd});
@@ -331,13 +357,21 @@ function createThemeAndWatchForUpdates() {
 }
 
 function handleAdoptedStyleSheets(node: ShadowRoot | Document) {
-    if (Array.isArray(node.adoptedStyleSheets)) {
-        if (node.adoptedStyleSheets.length > 0) {
-            const newManger = createAdoptedStyleSheetOverride(node);
+    try {
+        if (Array.isArray(node.adoptedStyleSheets)) {
+            if (node.adoptedStyleSheets.length > 0) {
+                const newManger = createAdoptedStyleSheetOverride(node);
 
-            adoptedStyleManagers.push(newManger);
-            newManger.render(filter, ignoredImageAnalysisSelectors);
+                adoptedStyleManagers.push(newManger);
+                newManger.render(filter, ignoredImageAnalysisSelectors);
+            }
         }
+    } catch (err) {
+        // For future readers, Dark Reader typically does not use 'try/catch' in its code but,
+        // due to a problem in Firefox Nightly, this is an exception. Allowing this exception
+        // to occur causes no consequence.
+        // Ref: https://github.com/darkreader/darkreader/issues/8789#issuecomment-1114210080
+        logWarn('Error occured in handleAdoptedStyleSheets: ', err);
     }
 }
 
@@ -397,6 +431,18 @@ function stopWatchingForUpdates() {
     cleanReadyStateCompleteListeners();
 }
 
+let metaObserver: MutationObserver;
+
+function addMetaListener() {
+    metaObserver = new MutationObserver(() => {
+        if (document.querySelector('meta[name="darkreader-lock"]')) {
+            metaObserver.disconnect();
+            removeDynamicTheme();
+        }
+    });
+    metaObserver.observe(document.head, {childList: true, subtree: true});
+}
+
 function createDarkReaderInstanceMarker() {
     const metaElement: HTMLMetaElement = document.createElement('meta');
     metaElement.name = 'darkreader';
@@ -405,6 +451,10 @@ function createDarkReaderInstanceMarker() {
 }
 
 function isAnotherDarkReaderInstanceActive() {
+    if (document.querySelector('meta[name="darkreader-lock"]')) {
+        return true;
+    }
+
     const meta: HTMLMetaElement = document.querySelector('meta[name="darkreader"]');
     if (meta) {
         if (meta.content !== INSTANCE_ID) {
@@ -413,6 +463,7 @@ function isAnotherDarkReaderInstanceActive() {
         return false;
     }
     createDarkReaderInstanceMarker();
+    addMetaListener();
     return false;
 }
 
@@ -498,6 +549,8 @@ export function removeDynamicTheme() {
         manager.destroy();
     });
     adoptedStyleManagers.splice(0);
+
+    metaObserver && metaObserver.disconnect();
 }
 
 export function cleanDynamicThemeCache() {

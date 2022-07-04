@@ -1,5 +1,6 @@
 import type {ParsedColorSchemeConfig} from './utils/colorscheme-parser';
 import type {FilterMode} from './generators/css-filter';
+import type {MessageType} from './utils/message';
 
 export interface ExtensionData {
     isEnabled: boolean;
@@ -17,10 +18,11 @@ export interface ExtensionData {
         hasCustomFilterFixes: boolean;
         hasCustomStaticFixes: boolean;
     };
+    activeTab: TabInfo;
 }
 
 export interface TabData {
-    type: string;
+    type: MessageType;
     data?: any;
 }
 
@@ -28,8 +30,9 @@ export interface ExtensionActions {
     changeSettings(settings: Partial<UserSettings>): void;
     setTheme(theme: Partial<FilterConfig>): void;
     setShortcut(command: string, shortcut: string): void;
-    toggleURL(url: string): void;
+    toggleActiveTab(): void;
     markNewsAsRead(ids: string[]): void;
+    markNewsAsDisplayed(ids: string[]): void;
     loadConfig(options: {local: boolean}): void;
     applyDevDynamicThemeFixes(text: string): Promise<void>;
     resetDevDynamicThemeFixes(): void;
@@ -123,7 +126,7 @@ export interface TabInfo {
 }
 
 export interface Message {
-    type: string;
+    type: MessageType;
     data?: any;
     id?: number;
     error?: any;
@@ -185,6 +188,8 @@ export interface News {
     date: string;
     url: string;
     headline: string;
-    important: boolean;
     read?: boolean;
+    displayed?: boolean;
+    badge?: string;
+    icon?: string;
 }

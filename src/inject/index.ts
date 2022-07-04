@@ -2,17 +2,17 @@ import {createOrUpdateStyle, removeStyle} from './style';
 import {createOrUpdateSVGFilter, removeSVGFilter} from './svg-filter';
 import {runDarkThemeDetector, stopDarkThemeDetector} from './detector';
 import {createOrUpdateDynamicTheme, removeDynamicTheme, cleanDynamicThemeCache} from './dynamic-theme';
-import {logInfo, logWarn} from '../utils/log';
-import {watchForColorSchemeChange} from './utils/watch-color-scheme';
+import {logInfo, logWarn, logInfoCollapsed} from '../utils/log';
+import {isSystemDarkScheme, runColorSchemeChangeDetector, stopColorSchemeChangeDetector} from './utils/watch-color-scheme';
 import {collectCSS} from './dynamic-theme/css-collection';
 import type {Message} from '../definitions';
 import {MessageType} from '../utils/message';
-import {isThunderbird} from '../utils/platform';
+import {isMV3, isThunderbird} from '../utils/platform';
 
 let unloaded = false;
 
 // TODO: Use background page color scheme watcher when browser bugs fixed.
-let colorSchemeWatcher = watchForColorSchemeChange(({isDark}) => {
+runColorSchemeChangeDetector((isDark) => {
     logInfo('Media query was changed');
     sendMessage({type: MessageType.CS_COLOR_SCHEME_CHANGE, data: {isDark}});
 });
@@ -24,39 +24,39 @@ function cleanup() {
     removeEventListener('resume', onResume);
     cleanDynamicThemeCache();
     stopDarkThemeDetector();
-    if (colorSchemeWatcher) {
-        colorSchemeWatcher.disconnect();
-        colorSchemeWatcher = null;
-    }
+    stopColorSchemeChangeDetector();
 }
 
 function sendMessage(message: Message) {
     if (unloaded) {
         return;
     }
-    try {
-        chrome.runtime.sendMessage<Message>(message, (response) => {
-            // Vivaldi bug workaround. See TabManager for details.
-            if (response === 'unsupportedSender') {
-                removeStyle();
-                removeSVGFilter();
-                removeDynamicTheme();
-                cleanup();
-            }
-        });
-    } catch (e) {
+    const responseHandler = (response: 'unsupportedSender' | undefined) => {
+        // Vivaldi bug workaround. See TabManager for details.
+        if (response === 'unsupportedSender') {
+            removeStyle();
+            removeSVGFilter();
+            removeDynamicTheme();
+            cleanup();
+        }
+    };
+
+    if (isMV3) {
         /*
          * Background can be unreachable if:
          *  - extension was disabled
          *  - extension was uninstalled
          *  - extension was updated and this is the old instance of content script
          */
-        cleanup();
+        const promise: Promise<Message | 'unsupportedSender'> = chrome.runtime.sendMessage<Message>(message) as any;
+        promise.then(responseHandler).catch(cleanup);
+    } else {
+        chrome.runtime.sendMessage<Message, 'unsupportedSender' | undefined>(message, responseHandler);
     }
 }
 
 function onMessage({type, data}: Message) {
-    logInfo('onMessage', type, data);
+    logInfoCollapsed(`onMessage[${type}]`, data);
     switch (type) {
         case MessageType.BG_ADD_CSS_FILTER:
         case MessageType.BG_ADD_STATIC_THEME: {
@@ -103,27 +103,27 @@ function onMessage({type, data}: Message) {
             }
             break;
         }
-        case MessageType.BG_EXPORT_CSS: {
+        case MessageType.BG_EXPORT_CSS:
             collectCSS().then((collectedCSS) => sendMessage({type: MessageType.CS_EXPORT_CSS_RESPONSE, data: collectedCSS}));
             break;
-        }
         case MessageType.BG_UNSUPPORTED_SENDER:
-        case MessageType.BG_CLEAN_UP: {
+        case MessageType.BG_CLEAN_UP:
             removeStyle();
             removeSVGFilter();
             removeDynamicTheme();
             stopDarkThemeDetector();
             break;
-        }
         case MessageType.BG_RELOAD:
             logWarn('Cleaning up before update');
             cleanup();
+            break;
+        default:
             break;
     }
 }
 
 chrome.runtime.onMessage.addListener(onMessage);
-sendMessage({type: MessageType.CS_FRAME_CONNECT});
+sendMessage({type: MessageType.CS_FRAME_CONNECT, data: {isDark: isSystemDarkScheme()}});
 
 function onPageHide(e: PageTransitionEvent) {
     if (e.persisted === false) {
@@ -136,7 +136,7 @@ function onFreeze() {
 }
 
 function onResume() {
-    sendMessage({type: MessageType.CS_FRAME_RESUME});
+    sendMessage({type: MessageType.CS_FRAME_RESUME, data: {isDark: isSystemDarkScheme()}});
 }
 
 function onDarkThemeDetected() {

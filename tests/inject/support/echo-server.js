@@ -1,7 +1,5 @@
 // @ts-check
 const http = require('http');
-const url = require('url');
-const queryString = require('querystring');
 
 async function createEchoServer(/** @type {number} */port) {
     /** @type {import('http').Server} */
@@ -9,7 +7,7 @@ async function createEchoServer(/** @type {number} */port) {
 
     /** @type {import('http').RequestListener} */
     function handleRequest(req, res) {
-        const parsedURL = url.parse(req.url);
+        const parsedURL = new URL(req.url, `http://${req.headers.host}`);
         const pathName = parsedURL.pathname;
 
         if (pathName !== '/echo') {
@@ -18,16 +16,16 @@ async function createEchoServer(/** @type {number} */port) {
             return;
         }
 
-        const parsedQuery = queryString.parse(parsedURL.query);
-        if (typeof parsedQuery.content !== 'string') {
+        const {searchParams} = parsedURL;
+
+        const content = searchParams.get('content');
+        if (!content) {
             res.statusCode = 500;
             res.end('Send content like /echo?type=text%2Fplain&content=XYZ');
             return;
         }
 
-        const contentType = parsedQuery.type || 'text/plain';
-        const content = parsedQuery.content;
-
+        const contentType = searchParams.get('type') || 'text/plain';
         res.statusCode = 200;
         res.setHeader('Content-Type', contentType);
         res.end(content, 'utf8');
